@@ -1,0 +1,106 @@
+name: Build & smoke-test macOS agent
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    # fail-fast: false so if one macOS label doesn't exist on this account,
+    # the others still run instead of the whole workflow being cancelled.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-13, macos-14, macos-15, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Report actual OS / arch
+        run: |
+          sw_vers
+          uname -m
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sanity-check Tcl/Tk (this is what broke on the old build machine)
+        run: |
+          python3 -c "
+          import tkinter
+          print('TkVersion:', tkinter.TkVersion)
+          root = tkinter.Tk()
+          root.destroy()
+          print('Tk root window created OK — no version-check crash')
+          "
+
+      - name: Install dependencies
+        working-directory: agent
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Build agent (.app)
+        working-directory: agent
+        run: |
+          source .venv/bin/activate
+          pyinstaller build/ak_direct_print.spec --clean --noconfirm
+
+      - name: Report built binary architecture
+        working-directory: agent
+        run: |
+          file dist/AKDirectPrint.app/Contents/MacOS/AKDirectPrint
+
+      - name: Smoke test — headless mode, fresh install (no config)
+        working-directory: agent
+        run: |
+          rm -f ~/.ak_direct_print/agent.log
+          rm -f ~/.config/ak_direct_print/config.json
+          ./dist/AKDirectPrint.app/Contents/MacOS/AKDirectPrint --headless --port 7654 &
+          AGENT_PID=$!
+          sleep 5
+          echo "--- /health ---"
+          curl -sS -m 5 http://127.0.0.1:7654/health
+          echo ""
+          echo "--- log ---"
+          cat ~/.ak_direct_print/agent.log || true
+          kill -9 $AGENT_PID 2>/dev/null || true
+
+      - name: Smoke test — fresh install with GUI path (no config, dialog would open)
+        working-directory: agent
+        run: |
+          rm -f ~/.ak_direct_print/agent.log
+          rm -f ~/.config/ak_direct_print/config.json
+          # Not headless this time — exercises the --_setup_subprocess path.
+          # If Tk were broken here, the PARENT should still survive and
+          # fall back to legacy mode (that's the whole point of the fix).
+          # (No `timeout` command — not guaranteed present on macOS runners;
+          # background + sleep + kill instead, as validated locally.)
+          ./dist/AKDirectPrint.app/Contents/MacOS/AKDirectPrint --port 7655 &
+          AGENT_PID=$!
+          sleep 8
+          echo "--- /health (parent should be serving regardless of dialog outcome) ---"
+          curl -sS -m 5 http://127.0.0.1:7655/health || echo "FAILED — parent did not come up"
+          echo ""
+          echo "--- log ---"
+          cat ~/.ak_direct_print/agent.log || true
+          kill -9 $AGENT_PID 2>/dev/null || true
+          pkill -9 -f AKDirectPrint 2>/dev/null || true
+
+      - name: Build .dmg
+        working-directory: agent
+        run: |
+          bash build/build_dmg.sh
+
+      - name: Upload .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AKDirectPrint-${{ matrix.runner }}-${{ runner.arch }}
+          path: agent/dist/AKDirectPrint.dmg
+          retention-days: 14

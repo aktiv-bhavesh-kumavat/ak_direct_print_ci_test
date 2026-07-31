@@ -1,0 +1,19 @@
+Package: ak-direct-print
+Version: 1.1.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Aktiv Software <odoo@aktivsoftware.com>
+Homepage: https://www.aktivsoftware.com
+Depends: cups, cups-client, avahi-utils, python3-gi, gir1.2-appindicator3-0.1
+Recommends: gnome-shell-extension-appindicator
+Description: AK Direct Print - Local Print Agent for Odoo
+ Bridges Odoo (including Odoo.sh and Odoo Online) to printers on the
+ client's local network. Runs silently in the system tray and receives
+ print jobs from the browser, forwarding them to CUPS or IPP printers.
+ .
+ Features:
+  - System tray icon with green/red status indicator
+  - Auto-starts on user login
+  - Supports CUPS and direct IPP (WiFi/AirPrint) printers
+  - Works with Odoo On-Premise, Odoo.sh, and Odoo Online

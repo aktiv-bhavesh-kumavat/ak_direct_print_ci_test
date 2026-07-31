@@ -1,0 +1,15 @@
+# ── Runtime (needed to RUN the agent as a Python script) ─────────────────────
+flask>=3.0
+requests>=2.31
+Pillow>=10.0
+pystray>=0.19
+
+# Windows only — local printer access via Win32 API
+pywin32>=306; sys_platform == "win32"
+# Windows only — rasterizes PDF pages for GDI printing (see _send_win32)
+pymupdf>=1.24; sys_platform == "win32"
+
+# macOS only — pystray's Darwin backend (tray icon) is built on AppKit
+pyobjc-core>=10.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"

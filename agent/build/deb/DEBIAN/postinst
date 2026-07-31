@@ -1,0 +1,160 @@
+#!/bin/bash
+# postinst — runs as root after package files are unpacked.
+# IMPORTANT: only the file-system steps (chmod, mkdir, desktop file) use set -e.
+# The agent launch is best-effort — failure must never abort the install,
+# because GNOME Software installs via pkexec which has no desktop session,
+# no DISPLAY, and no sudo(1) tty.  The autostart .desktop file guarantees
+# the agent starts on the user's next login regardless.
+
+set -e
+
+BINARY="/usr/local/bin/ak-direct-print"
+ICON_SRC="/usr/local/lib/ak-direct-print/icon.png"
+ICON_DEST="/usr/share/pixmaps/ak-direct-print.png"
+AUTOSTART_DIR="/etc/xdg/autostart"
+APPS_DIR="/usr/share/applications"
+AUTOSTART_FILE="$AUTOSTART_DIR/ak-direct-print.desktop"
+LAUNCHER_FILE="$APPS_DIR/ak-direct-print.desktop"
+
+# ── 1. Ensure binary is executable ───────────────────────────────────────────
+chmod 755 "$BINARY"
+
+# ── 2. Install icon ──────────────────────────────────────────────────────────
+if [ -f "$ICON_SRC" ]; then
+    cp "$ICON_SRC" "$ICON_DEST"
+    chmod 644 "$ICON_DEST"
+fi
+ICON_NAME="ak-direct-print"
+[ -f "$ICON_DEST" ] || ICON_NAME="printer"  # fallback to system theme icon
+
+# ── 3. App launcher entry (appears in GNOME Activities / app menu) ────────────
+mkdir -p "$APPS_DIR"
+cat > "$LAUNCHER_FILE" << EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AK Direct Print
+GenericName=Odoo Print Station
+Comment=Connect this machine to your Odoo instance as a Print Station
+Exec=/usr/local/bin/ak-direct-print --setup
+Icon=$ICON_NAME
+Terminal=false
+Categories=Office;Utility;
+Keywords=print;printer;odoo;direct;station;
+StartupNotify=false
+EOF
+chmod 644 "$LAUNCHER_FILE"
+
+# ── 4. System-wide autostart (silent, no dialog) for all future logins ───────
+mkdir -p "$AUTOSTART_DIR"
+cat > "$AUTOSTART_FILE" << EOF
+[Desktop Entry]
+Type=Application
+Name=AK Direct Print
+GenericName=Local Print Agent
+Exec=/usr/local/bin/ak-direct-print
+Icon=$ICON_NAME
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
+Comment=AK Direct Print station agent — starts silently on login
+Keywords=print;printer;odoo;direct;
+EOF
+chmod 644 "$AUTOSTART_FILE"
+
+# Refresh app database so the launcher appears immediately
+command -v update-desktop-database >/dev/null 2>&1 && \
+    update-desktop-database "$APPS_DIR" 2>/dev/null || true
+
+# ── 3. Enable and start CUPS + Avahi ─────────────────────────────────────────
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable cups         2>/dev/null || true
+    systemctl start  cups         2>/dev/null || true
+    systemctl enable avahi-daemon 2>/dev/null || true
+    systemctl start  avahi-daemon 2>/dev/null || true
+fi
+
+# ── 4. Best-effort: launch agent into the current desktop session ─────────────
+# Disabled set -e for everything below — launch failures must not fail the pkg.
+set +e
+
+# Kill any already-running agent before launching the new one.
+# This handles upgrades where prerm's SIGTERM may not have taken effect yet
+# by the time postinst runs — without this, pgrep sees the dying process and
+# skips the launch, leaving nothing running after the upgrade completes.
+for _PROC_EXE in /proc/[0-9]*/exe; do
+    if [ "$(readlink "$_PROC_EXE" 2>/dev/null)" = "$BINARY" ]; then
+        _PID="${_PROC_EXE%/exe}"
+        kill "${_PID##*/}" 2>/dev/null
+    fi
+done
+# Give the process a moment to exit before we launch the new one
+sleep 1
+
+_launch_for_user() {
+    local UNAME="$1"
+    local UID_NUM
+    UID_NUM=$(id -u "$UNAME" 2>/dev/null) || return 0
+
+    local XDG_RT="/run/user/$UID_NUM"
+    local DBUS_ADDR="unix:path=$XDG_RT/bus"
+
+    # Try Wayland first (Ubuntu 22.04+ default), then X11.
+    # Use 'su' not 'sudo -u': su works from any root context (pkexec, dpkg, etc.)
+    if [ -S "$XDG_RT/wayland-0" ]; then
+        su -s /bin/bash "$UNAME" -c \
+            "env WAYLAND_DISPLAY=wayland-0 \
+                 XDG_RUNTIME_DIR='$XDG_RT' \
+                 DBUS_SESSION_BUS_ADDRESS='$DBUS_ADDR' \
+                 GDK_BACKEND=wayland \
+             nohup '$BINARY' >/dev/null 2>&1 &" 2>/dev/null || true
+        echo "  ✔  Agent launched for $UNAME (Wayland)"
+        return 0
+    fi
+
+    local DISP=""
+    [ -S "/tmp/.X11-unix/X0" ] && DISP=":0"
+    [ -S "/tmp/.X11-unix/X1" ] && DISP=":1"
+    if [ -n "$DISP" ]; then
+        su -s /bin/bash "$UNAME" -c \
+            "env DISPLAY='$DISP' \
+                 XDG_RUNTIME_DIR='$XDG_RT' \
+                 DBUS_SESSION_BUS_ADDRESS='$DBUS_ADDR' \
+             nohup '$BINARY' >/dev/null 2>&1 &" 2>/dev/null || true
+        echo "  ✔  Agent launched for $UNAME (X11, DISPLAY=$DISP)"
+        return 0
+    fi
+
+    echo "  ℹ  No desktop session detected — agent starts automatically on next login."
+    return 0
+}
+
+# Find logged-in desktop users via loginctl (most reliable across Ubuntu versions)
+LAUNCHED=0
+if command -v loginctl >/dev/null 2>&1; then
+    while IFS= read -r SESSION_LINE; do
+        SESSION_USER=$(echo "$SESSION_LINE" | awk '{print $3}')
+        SESSION_ID=$(echo "$SESSION_LINE" | awk '{print $1}')
+        SESSION_TYPE=$(loginctl show-session "$SESSION_ID" -p Type --value 2>/dev/null || echo "")
+        if [ "$SESSION_USER" != "root" ] && \
+           { [ "$SESSION_TYPE" = "x11" ] || [ "$SESSION_TYPE" = "wayland" ]; }; then
+            _launch_for_user "$SESSION_USER"
+            LAUNCHED=1
+        fi
+    done < <(loginctl list-sessions --no-legend 2>/dev/null)
+fi
+
+# Fallback: 'who' output when loginctl finds nothing
+if [ "$LAUNCHED" -eq 0 ]; then
+    FALLBACK_USER=$(who 2>/dev/null | awk '!/root/ && NF>0 {print $1; exit}')
+    if [ -n "$FALLBACK_USER" ]; then
+        _launch_for_user "$FALLBACK_USER"
+    fi
+fi
+
+echo ""
+echo "  ✔  AK Direct Print installed successfully."
+echo "  The agent will appear as a green icon in your system tray."
+echo "  (If not visible now, it starts automatically on next login.)"
+echo ""

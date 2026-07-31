@@ -1,0 +1,4 @@
+# ── Build only (needed to BUILD the .exe / binary with PyInstaller) ──────────
+# Install these in addition to requirements.txt before running build.sh / build.bat
+
+pyinstaller>=6.0

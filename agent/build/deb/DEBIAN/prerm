@@ -1,0 +1,37 @@
+#!/bin/bash
+# Kill agent binary and tray subprocess.
+#
+# Agent: use /proc/PID/exe — immune to process-name truncation (kernel caps
+#   comm at 15 chars: "ak-direct-print.prerm" → "ak-direct-print") and to
+#   cmdline matching (pkill -f would match dpkg/prerm itself).
+#
+# Tray: tray.py writes its PID to ~/.ak_direct_print/tray.pid on start.
+set +e
+
+# Kill the agent binary
+for PROC_EXE in /proc/[0-9]*/exe; do
+    if [ "$(readlink "$PROC_EXE" 2>/dev/null)" = "/usr/local/bin/ak-direct-print" ]; then
+        PID="${PROC_EXE%/exe}"
+        kill "${PID##*/}" 2>/dev/null
+    fi
+done
+
+# Kill the tray subprocess
+for HOME_DIR in /home/*; do
+    TRAY_PID_FILE="$HOME_DIR/.ak_direct_print/tray.pid"
+    if [ -f "$TRAY_PID_FILE" ]; then
+        TRAY_PID=$(cat "$TRAY_PID_FILE" 2>/dev/null)
+        if [ -n "$TRAY_PID" ] && kill -0 "$TRAY_PID" 2>/dev/null; then
+            kill "$TRAY_PID" 2>/dev/null
+        fi
+        rm -f "$TRAY_PID_FILE" 2>/dev/null
+    fi
+done
+
+# Remove autostart entries
+rm -f /etc/xdg/autostart/ak-direct-print.desktop 2>/dev/null
+for HOME_DIR in /home/*; do
+    rm -f "$HOME_DIR/.config/autostart/ak-direct-print.desktop" 2>/dev/null
+    rm -f "$HOME_DIR/.config/autostart/com.aktivsoftware.ak-direct-print.desktop" 2>/dev/null
+done
+exit 0
