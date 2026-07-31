@@ -12,7 +12,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-13, macos-14, macos-15, macos-latest]
+        # macos-13 dropped — got stuck queued indefinitely (likely a
+        # deprecated image), and it's Intel/older anyway, not relevant to
+        # validating macOS 15/26. macos-14/15 = Sonoma/Sequoia (confirmed
+        # arm64), macos-latest tracked as macOS 26 (Tahoe) on 2026-07-31.
+        runner: [macos-14, macos-15, macos-latest]
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -64,13 +68,23 @@ jobs:
           rm -f ~/.config/ak_direct_print/config.json
           ./dist/AKDirectPrint.app/Contents/MacOS/AKDirectPrint --headless --port 7654 &
           AGENT_PID=$!
-          sleep 5
-          echo "--- /health ---"
-          curl -sS -m 5 http://127.0.0.1:7654/health
+          echo "--- waiting for /health (up to 60s — first launch on a brand-new runner can be slow) ---"
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sS -m 2 http://127.0.0.1:7654/health; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
           echo ""
           echo "--- log ---"
           cat ~/.ak_direct_print/agent.log || true
           kill -9 $AGENT_PID 2>/dev/null || true
+          if [ "$ok" != "1" ]; then
+            echo "Agent never responded on /health within 60s"
+            exit 1
+          fi
 
       - name: Smoke test — fresh install with GUI path (no config, dialog would open)
         working-directory: agent
@@ -84,9 +98,13 @@ jobs:
           # background + sleep + kill instead, as validated locally.)
           ./dist/AKDirectPrint.app/Contents/MacOS/AKDirectPrint --port 7655 &
           AGENT_PID=$!
-          sleep 8
-          echo "--- /health (parent should be serving regardless of dialog outcome) ---"
-          curl -sS -m 5 http://127.0.0.1:7655/health || echo "FAILED — parent did not come up"
+          echo "--- waiting for /health (up to 60s) — parent should serve regardless of dialog outcome ---"
+          for i in $(seq 1 30); do
+            if curl -sS -m 2 http://127.0.0.1:7655/health; then
+              break
+            fi
+            sleep 2
+          done
           echo ""
           echo "--- log ---"
           cat ~/.ak_direct_print/agent.log || true
