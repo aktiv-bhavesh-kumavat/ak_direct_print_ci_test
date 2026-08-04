@@ -1,0 +1,87 @@
+name: Build & smoke-test Windows agent
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 32-bit (x86) and 64-bit (x64) Python, matching the exe naming
+        # already used in the product (AKDirectPrint_Setup.exe /
+        # AKDirectPrint_Setup_x86.exe). GitHub's Windows runners are 64-bit
+        # Windows Server, but 64-bit Windows natively runs 32-bit apps via
+        # WOW64 (no emulation needed, unlike arm64 vs x86_64 on macOS) — so
+        # this is genuine, representative testing for both architectures.
+        architecture: [x64, x86]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12 (${{ matrix.architecture }})
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.architecture }}
+
+      - name: Confirm interpreter architecture
+        run: python -c "import struct, platform; print(platform.machine(), struct.calcsize('P') * 8, 'bit')"
+
+      - name: Install dependencies
+        working-directory: agent
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Build agent (.exe)
+        working-directory: agent
+        run: pyinstaller build\ak_direct_print.spec --clean --noconfirm
+
+      - name: Report built exe architecture
+        working-directory: agent
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("dist\AKDirectPrint.exe")
+          $peOffset = [System.BitConverter]::ToInt32($bytes, 60)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          switch ($machine) {
+            0x8664 { "Machine type: x64 (0x8664)" }
+            0x14c  { "Machine type: x86 (0x14c)" }
+            default { "Machine type: unknown (0x{0:X})" -f $machine }
+          }
+
+      - name: Smoke test — headless mode, fresh install (no config)
+        working-directory: agent
+        shell: pwsh
+        run: |
+          Remove-Item -ErrorAction SilentlyContinue "$env:USERPROFILE\.ak_direct_print\agent.log"
+          Remove-Item -ErrorAction SilentlyContinue "$env:USERPROFILE\.config\ak_direct_print\config.json"
+          Start-Process -FilePath "dist\AKDirectPrint.exe" -ArgumentList "--headless --port 7654"
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:7654/health" -TimeoutSec 2 -UseBasicParsing
+              Write-Host $resp.Content
+              $ok = $true
+              break
+            } catch {}
+          }
+          Write-Host "--- log ---"
+          Get-Content -ErrorAction SilentlyContinue "$env:USERPROFILE\.ak_direct_print\agent.log"
+          Stop-Process -Name "AKDirectPrint" -Force -ErrorAction SilentlyContinue
+          if (-not $ok) {
+            Write-Error "Agent never responded on /health within 60s"
+            exit 1
+          }
+
+      - name: Upload .exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AKDirectPrint-${{ matrix.architecture }}
+          path: agent/dist/AKDirectPrint.exe
+          retention-days: 14

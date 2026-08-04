@@ -1258,6 +1258,39 @@ class StationClient:
         return True
 
 
+def _apply_new_station_config(new_config):
+    """Swap in a freshly-saved config without requiring an app restart.
+
+    Stops the currently-running StationClient (if any) and replaces it with
+    one built from the new config, updating _station_client_ref so every
+    consumer (Flask /station_status, /tray/sync, the tray menu) picks up the
+    new client on its next check — no manual restart needed after
+    reconfiguring via "Configure Station…".
+    """
+    old = _station_client_ref[0]
+    if old:
+        old.stop()
+
+    if not new_config.get("odoo_url"):
+        _station_client_ref[0] = None
+        return False
+
+    new_client = StationClient(new_config)
+    try:
+        ok = new_client.run()
+    except Exception as exc:
+        _logger.error("Failed to apply new station config: %s", exc)
+        _station_client_ref[0] = None
+        return False
+
+    _station_client_ref[0] = new_client
+    # Use run()'s own return value, not .connected — .connected is only set
+    # by the background heartbeat thread on its first round-trip, which
+    # hasn't happened yet the instant run() returns (that raced to a false
+    # "failed" result in testing even on a genuinely successful reconnect).
+    return bool(ok)
+
+
 # ---------------------------------------------------------------------------
 # Auto-start helpers
 # ---------------------------------------------------------------------------
@@ -1822,27 +1855,56 @@ def _run_tray(port, station_client=None):
 
     def on_configure(icon, item):
         def _show():
+            old_cfg = load_config()
             # Runs in an isolated subprocess — see the --_setup_subprocess
             # branch in main() for why (Tk can abort the whole process
             # natively on some macOS/Tcl-Tk combos).
             try:
-                subprocess.run(_get_launch_argv("--_setup_subprocess"), timeout=600)
+                subprocess.run(
+                    _get_launch_argv("--_setup_subprocess"),
+                    timeout=600,
+                )
             except Exception as exc:
                 _logger.error("Setup dialog subprocess failed to run: %s", exc)
+                return
+
+            new_cfg = load_config()
+            if new_cfg == old_cfg:
+                return  # dialog was cancelled — nothing to apply
+
+            connected = _apply_new_station_config(new_cfg)
+            try:
+                if connected:
+                    icon.notify(
+                        "Connected — station \"%s\" is online."
+                        % new_cfg.get("station_name", APP_NAME),
+                        APP_NAME,
+                    )
+                else:
+                    icon.notify(
+                        "Saved, but couldn't connect — check the URL and credentials.",
+                        APP_NAME,
+                    )
+            except Exception:
+                pass  # notifications aren't supported on every backend
+
         threading.Thread(target=_show, daemon=True, name="setup_dialog").start()
 
     def on_sync(icon, item):
-        if station_client:
-            threading.Thread(target=station_client.sync_printers,
+        sc = _station_client_ref[0]
+        if sc:
+            threading.Thread(target=sc.sync_printers,
                              daemon=True, name="sync_printers").start()
 
     def on_quit(icon, item):
-        if station_client:
-            station_client.stop()
+        sc = _station_client_ref[0]
+        if sc:
+            sc.stop()
         icon.stop()
 
     def _is_online():
-        return bool(station_client and station_client.token)
+        sc = _station_client_ref[0]
+        return bool(sc and sc.token)
 
     def _station_label(item):
         cfg = load_config()
@@ -1922,22 +1984,16 @@ def main():
     # here, in a disposable subprocess, keeps that from ever taking down
     # the Flask server / tray icon in the parent. SetupDialog.run() already
     # calls save_config() internally before returning, so the parent just
-    # needs to reload config afterwards — no IPC return value needed.
+    # needs to reload config afterwards — no IPC return value needed. The
+    # parent (main-run or the tray's on_configure) is responsible for
+    # detecting the change and applying it live — no restart required, and
+    # no popup here since this child has no idea whether that reconnect
+    # will actually succeed.
     if args._setup_subprocess:
         cfg = load_config()
         try:
             dlg = SetupDialog(cfg)
-            new_cfg = dlg.run()
-            if new_cfg:
-                try:
-                    import tkinter.messagebox as _mb
-                    _mb.showinfo(
-                        "Restart Required",
-                        "Configuration saved.\n\n"
-                        "Please quit and restart AK Direct Print for the new settings to take effect.",
-                    )
-                except Exception:
-                    pass
+            dlg.run()
         except Exception as exc:
             _logger.error("Setup dialog failed: %s", exc)
         return

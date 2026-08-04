@@ -104,6 +104,28 @@ sudo apt install -y cups cups-client avahi-utils python3-gi \
 3. Right-click → **Start on Login** → enable it
 4. Done
 
+### 4a. "AKDirectPrint cannot be opened because the developer cannot be verified"
+
+This is expected — the app isn't yet signed with an Apple Developer ID, so
+macOS Gatekeeper blocks apps downloaded from a browser by default. This is a
+one-time step per machine; it does **not** happen again after the first
+successful launch. Two ways to get past it:
+
+**Option A — System Settings (no Terminal needed):**
+1. Click **Cancel** on the warning (not "Move to Bin").
+2. Open **System Settings → Privacy & Security**.
+3. Scroll down — you'll see a message that AKDirectPrint was blocked, with
+   an **Open Anyway** button next to it. Click it (enter your Mac password
+   or Touch ID if asked).
+4. Open `AKDirectPrint` from `/Applications` again — this time click
+   **Open** on the (now much milder) confirmation dialog.
+
+**Option B — Terminal (one command, faster):**
+```bash
+xattr -d com.apple.quarantine /Applications/AKDirectPrint.app
+```
+Then open the app normally.
+
 ---
 
 ## 5. Tray Icon — Menu Reference
