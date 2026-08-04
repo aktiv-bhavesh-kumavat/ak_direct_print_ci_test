@@ -85,3 +85,102 @@ jobs:
           name: AKDirectPrint-${{ matrix.architecture }}
           path: agent/dist/AKDirectPrint.exe
           retention-days: 14
+
+      # ── The steps above only test the raw PyInstaller .exe. The actual
+      # client deliverable is AKDirectPrint_Setup.exe, produced by wrapping
+      # that .exe with Inno Setup (see build/windows/ak_direct_print.iss) —
+      # everything below builds and genuinely installs/uninstalls THAT, so
+      # CI validates what ships, not just what PyInstaller produces.
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build the real installer (AKDirectPrint_Setup.exe)
+        working-directory: agent
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" build\windows\ak_direct_print.iss'
+
+      - name: Silent-install AKDirectPrint_Setup.exe
+        working-directory: agent
+        shell: pwsh
+        run: |
+          Start-Process -FilePath ".\dist\AKDirectPrint_Setup.exe" `
+            -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=install.log" -Wait
+          Get-Content install.log -ErrorAction SilentlyContinue | Select-Object -Last 30
+
+      - name: Verify install artifacts (exe, autostart registry key)
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "$env:LOCALAPPDATA\Programs\AK Direct Print\AKDirectPrint.exe",
+            "$env:ProgramFiles\AK Direct Print\AKDirectPrint.exe",
+            "${env:ProgramFiles(x86)}\AK Direct Print\AKDirectPrint.exe"
+          )
+          $installed = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $installed) {
+            Write-Error "Installed AKDirectPrint.exe not found in any expected location: $($candidates -join ', ')"
+            exit 1
+          }
+          Write-Host "Installed at: $installed"
+          "INSTALLED_EXE=$installed" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $regVal = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+            -Name "AK Direct Print" -ErrorAction SilentlyContinue
+          if ($regVal) {
+            Write-Host "Autostart registry key: found -> $($regVal.'AK Direct Print')"
+          } else {
+            Write-Error "Autostart registry key NOT found (Start on Login task is checked by default in the .iss)"
+            exit 1
+          }
+
+      - name: Smoke test the INSTALLED copy (not just the raw build output)
+        shell: pwsh
+        run: |
+          Remove-Item -ErrorAction SilentlyContinue "$env:USERPROFILE\.ak_direct_print\agent.log"
+          Remove-Item -ErrorAction SilentlyContinue "$env:USERPROFILE\.config\ak_direct_print\config.json"
+          Start-Process -FilePath "$env:INSTALLED_EXE" -ArgumentList "--headless --port 7656"
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:7656/health" -TimeoutSec 2 -UseBasicParsing
+              Write-Host $resp.Content
+              $ok = $true
+              break
+            } catch {}
+          }
+          Write-Host "--- log ---"
+          Get-Content -ErrorAction SilentlyContinue "$env:USERPROFILE\.ak_direct_print\agent.log"
+          Stop-Process -Name "AKDirectPrint" -Force -ErrorAction SilentlyContinue
+          if (-not $ok) {
+            Write-Error "Installed agent never responded on /health within 60s"
+            exit 1
+          }
+
+      - name: Silent-uninstall and verify cleanup
+        shell: pwsh
+        run: |
+          $uninstaller = Join-Path (Split-Path "$env:INSTALLED_EXE") "unins000.exe"
+          if (-not (Test-Path $uninstaller)) {
+            Write-Error "Uninstaller not found at $uninstaller"
+            exit 1
+          }
+          Start-Process -FilePath $uninstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
+          Start-Sleep -Seconds 3
+          if (Test-Path "$env:INSTALLED_EXE") {
+            Write-Error "AKDirectPrint.exe still present after uninstall"
+            exit 1
+          }
+          $regVal = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+            -Name "AK Direct Print" -ErrorAction SilentlyContinue
+          if ($regVal) {
+            Write-Error "Autostart registry key NOT removed after uninstall"
+            exit 1
+          }
+          Write-Host "Uninstall verified clean — exe removed, registry key removed."
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AKDirectPrint_Setup-${{ matrix.architecture }}
+          path: agent/dist/AKDirectPrint_Setup.exe
+          retention-days: 14
