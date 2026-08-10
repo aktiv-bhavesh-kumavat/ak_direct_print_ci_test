@@ -1190,7 +1190,11 @@ class StationClient:
             self._report_done(job_id, False, "Invalid PDF data: %s" % exc)
             return
 
-        result = self._print_to_os_printer(pdf_bytes, printer_name, pdf_filename, copies)
+        printer_type = (job.get("printer_type") or "pdf").strip()
+        if printer_type == "escpos":
+            result = self._print_escpos(pdf_bytes, job)
+        else:
+            result = self._print_to_os_printer(pdf_bytes, printer_name, pdf_filename, copies)
         self._report_done(job_id, result["success"], result["message"])
 
     def _print_to_os_printer(self, pdf_bytes, printer_name, job_name, copies):
@@ -1202,6 +1206,82 @@ class StationClient:
             return _send_cups(pdf_bytes, printer_name, job_name, copies)
         else:
             return {"success": False, "message": "No print backend available (lp/CUPS not found)."}
+
+    def _print_escpos(self, pdf_bytes, job):
+        """Rasterize PDF and send to a network ESC/POS thermal printer.
+
+        Pipeline:
+          1. pdf2image (poppler) converts the PDF page(s) to PIL images at 203 DPI.
+          2. python-escpos sends each image to the printer over TCP and cuts the paper.
+
+        System requirement: poppler-utils must be installed on the agent machine.
+          Linux : sudo apt-get install poppler-utils
+          macOS : brew install poppler
+          Windows: install poppler binaries and add to PATH
+        """
+        job_id = job.get("id")
+        paper_width_mm = int(job.get("paper_width_mm") or 80)
+        printer_ip = (job.get("printer_ip") or "").strip()
+        printer_port = int(job.get("printer_tcp_port") or 9100)
+        copies = max(1, int(job.get("copies") or 1))
+
+        # ── Dependency checks ─────────────────────────────────────────────────
+        try:
+            from pdf2image import convert_from_bytes
+        except ImportError:
+            return {
+                "success": False,
+                "message": (
+                    "pdf2image is not installed. "
+                    "Run: pip install pdf2image  and  apt install poppler-utils"
+                ),
+            }
+
+        try:
+            from escpos.printer import Network as EscNetwork
+        except ImportError:
+            return {
+                "success": False,
+                "message": "python-escpos is not installed. Run: pip install python-escpos",
+            }
+
+        if not printer_ip:
+            return {
+                "success": False,
+                "message": (
+                    "ESC/POS printer has no IP address configured. "
+                    "Open the printer record in Odoo and set the Printer IP Address."
+                ),
+            }
+
+        # ── Step 1: Rasterize PDF → PIL images ───────────────────────────────
+        # 203 DPI is the standard resolution for thermal receipt printers.
+        # width_px is derived from the physical paper width so the image fills
+        # the printable area exactly without scaling on the printer side.
+        try:
+            width_px = int(paper_width_mm / 25.4 * 203)
+            images = convert_from_bytes(pdf_bytes, dpi=203, size=(width_px, None))
+        except Exception as exc:
+            return {"success": False, "message": "PDF rasterize failed: %s" % exc}
+
+        # ── Step 2: Send via ESC/POS ──────────────────────────────────────────
+        try:
+            p = EscNetwork(printer_ip, printer_port)
+            for _ in range(copies):
+                for img in images:
+                    p.image(img)
+                p.cut()
+            p.close()
+            _logger.info(
+                "ESC/POS job %s: %d page(s) × %d copies → %s:%d",
+                job_id, len(images), copies, printer_ip, printer_port,
+            )
+            return {
+                "success": True,
+                "message": "ESC/POS print OK — %d page(s)" % len(images),
+            }
+        except Exception as exc:
+            return {"success": False, "message": "ESC/POS send failed: %s" % exc}
 
     def _report_done(self, job_id, success, message):
         try:
@@ -1492,17 +1572,16 @@ class SetupDialog:
         )
         ent.grid(row=grid_row + 1, column=col, columnspan=colspan, sticky="ew",
                  padx=(padx_l, padx_r), pady=(0, 4))
-        self._bind_mac_editing_keys(ent)
+        self._bind_editing_keys(ent)
         return var
 
     @staticmethod
-    def _bind_mac_editing_keys(entry):
-        """Explicitly bind Cmd+A/C/V/X on an Entry.
+    def _bind_editing_keys(entry):
+        """Bind standard editing shortcuts on an Entry for all platforms.
 
-        Tk's built-in Entry bindings on macOS don't reliably cover all of
-        select-all/copy/paste/cut via the Command key — Select All in
-        particular isn't bound at all by default — which showed up as
-        "select all / remove text not working well".
+        Linux/Windows use Control+Key; macOS uses Command+Key.
+        Ctrl+A (select all) is not bound by default on Linux tkinter.
+        Both key families are bound so the same binary works everywhere.
         """
         def _select_all(event):
             event.widget.select_range(0, "end")
@@ -1521,6 +1600,12 @@ class SetupDialog:
             event.widget.event_generate("<<Cut>>")
             return "break"
 
+        # Linux / Windows
+        entry.bind("<Control-a>", _select_all)
+        entry.bind("<Control-c>", _copy)
+        entry.bind("<Control-v>", _paste)
+        entry.bind("<Control-x>", _cut)
+        # macOS (Command key)
         entry.bind("<Command-a>", _select_all)
         entry.bind("<Command-c>", _copy)
         entry.bind("<Command-v>", _paste)

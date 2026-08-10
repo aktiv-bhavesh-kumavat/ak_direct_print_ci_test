@@ -4,6 +4,14 @@ requests>=2.31
 Pillow>=10.0
 pystray>=0.19
 
+# ESC/POS thermal printer support
+# System dependency also required: poppler-utils
+#   Linux : sudo apt-get install poppler-utils
+#   macOS : brew install poppler
+#   Windows: install poppler binaries and add to PATH
+python-escpos>=3.0
+pdf2image>=1.16
+
 # Windows only — local printer access via Win32 API
 pywin32>=306; sys_platform == "win32"
 # Windows only — rasterizes PDF pages for GDI printing (see _send_win32)
