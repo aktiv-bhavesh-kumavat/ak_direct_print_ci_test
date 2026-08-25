@@ -608,23 +608,23 @@ def _cups_ipp_print(cups_mod, pdf_bytes, cups_name, job_name, copies):
     )
 
     def _printer_error(conn, cups_name):
-        """Query printer-state-reasons via python-cups.
-        Returns (is_error: bool, reason: str). Never raises."""
+        """Return (is_error, reason) by querying printer-state via python-cups.
+        Only returns True when printer-state == 5 (stopped/error).
+        States 3 (idle) and 4 (processing) are never an error, even if
+        printer-state-reasons still contains stale keywords from a prior fault.
+        Never raises."""
         try:
             attrs = conn.getPrinterAttributes(
                 cups_name,
                 requested_attributes=["printer-state", "printer-state-reasons"],
             )
             state = attrs.get("printer-state", 3)
+            if state != 5:
+                return False, ""
             reasons = attrs.get("printer-state-reasons", "")
             if isinstance(reasons, list):
                 reasons = " ".join(str(r) for r in reasons)
-            reasons_lower = reasons.lower()
-            # "none" means no error in IPP
-            if "none" in reasons_lower and not any(k in reasons_lower for k in _HW_ERROR_KEYWORDS):
-                return False, ""
-            if state == 5 or any(k in reasons_lower for k in _HW_ERROR_KEYWORDS):
-                return True, reasons or "printer stopped"
+            return True, reasons or "printer stopped"
         except Exception:
             pass
         return False, ""
@@ -634,14 +634,6 @@ def _cups_ipp_print(cups_mod, pdf_bytes, cups_name, job_name, copies):
     job_id = None
     try:
         conn = cups_mod.Connection()
-
-        # Pre-flight: reject immediately if printer already has a hardware error
-        # (e.g. paper was already out before the job was sent).
-        has_err, err_reason = _printer_error(conn, cups_name)
-        if has_err:
-            _logger.warning("CUPS pre-flight: '%s' not ready — %s", cups_name, err_reason)
-            return {"success": False,
-                    "message": "Printer is not ready: %s" % err_reason}
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(pdf_bytes)
@@ -796,13 +788,6 @@ def _cups_lp_print(pdf_bytes, cups_name, job_name, copies):
     """
     tmp_path = None
     try:
-        # Pre-flight: check printer state before submitting
-        has_err, err_reason = _cups_lp_printer_error(cups_name)
-        if has_err:
-            _logger.warning("CUPS lp pre-flight: '%s' not ready — %s", cups_name, err_reason)
-            return {"success": False,
-                    "message": "Printer is not ready: %s" % err_reason}
-
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(pdf_bytes)
             tmp_path = f.name
