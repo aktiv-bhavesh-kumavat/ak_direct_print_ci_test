@@ -116,9 +116,32 @@ jobs:
         run: |
           bash build/build_dmg.sh
 
-      - name: Upload .dmg artifact
+      - name: Rename .dmg for distribution
+        if: matrix.runner == 'macos-14'
+        working-directory: agent/dist
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            cp AKDirectPrint.dmg AKDirectPrint_intel.dmg
+            echo "RELEASE_DMG=AKDirectPrint_intel.dmg" >> $GITHUB_ENV
+            echo "RELEASE_ARTIFACT=release-macos-intel" >> $GITHUB_ENV
+          else
+            cp AKDirectPrint.dmg AKDirectPrint_arm64.dmg
+            echo "RELEASE_DMG=AKDirectPrint_arm64.dmg" >> $GITHUB_ENV
+            echo "RELEASE_ARTIFACT=release-macos-arm64" >> $GITHUB_ENV
+          fi
+
+      - name: Upload release artifact (macos-14 only)
+        if: matrix.runner == 'macos-14'
         uses: actions/upload-artifact@v4
         with:
-          name: AKDirectPrint-${{ matrix.runner }}-${{ runner.arch }}
+          name: ${{ env.RELEASE_ARTIFACT }}
+          path: agent/dist/${{ env.RELEASE_DMG }}
+          retention-days: 90
+
+      - name: Upload smoke-test artifact (all runners)
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoketest-${{ matrix.runner }}-${{ runner.arch }}
           path: agent/dist/AKDirectPrint.dmg
-          retention-days: 14
+          retention-days: 7

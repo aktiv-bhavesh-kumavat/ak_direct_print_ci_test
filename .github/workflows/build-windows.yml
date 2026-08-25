@@ -178,9 +178,23 @@ jobs:
           }
           Write-Host "Uninstall verified clean — exe removed, registry key removed."
 
-      - name: Upload installer artifact
+      - name: Rename installer for distribution
+        shell: pwsh
+        working-directory: agent/dist
+        run: |
+          if ("${{ matrix.architecture }}" -eq "x86") {
+            Copy-Item AKDirectPrint_Setup.exe AKDirectPrint_Setup_x86.exe
+            "RELEASE_EXE=AKDirectPrint_Setup_x86.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "RELEASE_ARTIFACT=release-windows-x86" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            Copy-Item AKDirectPrint_Setup.exe AKDirectPrint_Setup_x64.exe
+            "RELEASE_EXE=AKDirectPrint_Setup_x64.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "RELEASE_ARTIFACT=release-windows-x64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AKDirectPrint_Setup-${{ matrix.architecture }}
-          path: agent/dist/AKDirectPrint_Setup.exe
-          retention-days: 14
+          name: ${{ env.RELEASE_ARTIFACT }}
+          path: agent/dist/${{ env.RELEASE_EXE }}
+          retention-days: 90
