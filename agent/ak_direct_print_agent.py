@@ -596,15 +596,57 @@ def _send_cups(pdf_bytes, cups_name, job_name, copies):
 
 def _cups_ipp_print(cups_mod, pdf_bytes, cups_name, job_name, copies):
     """Submit job via python-cups and poll getJobAttributes for exact IPP state."""
+
+    # Hardware error keywords checked in both printer-state-reasons and job-state-reasons.
+    _HW_ERROR_KEYWORDS = (
+        "media-empty", "media-needed", "media-low",
+        "media-jam", "paper-jam", "jammed",
+        "toner-empty", "toner-low",
+        "cover-open", "door-open",
+        "input-tray-missing", "output-tray-missing",
+        "marker-supply-empty", "offline", "shutdown",
+    )
+
+    def _printer_error(conn, cups_name):
+        """Query printer-state-reasons via python-cups.
+        Returns (is_error: bool, reason: str). Never raises."""
+        try:
+            attrs = conn.getPrinterAttributes(
+                cups_name,
+                requested_attributes=["printer-state", "printer-state-reasons"],
+            )
+            state = attrs.get("printer-state", 3)
+            reasons = attrs.get("printer-state-reasons", "")
+            if isinstance(reasons, list):
+                reasons = " ".join(str(r) for r in reasons)
+            reasons_lower = reasons.lower()
+            # "none" means no error in IPP
+            if "none" in reasons_lower and not any(k in reasons_lower for k in _HW_ERROR_KEYWORDS):
+                return False, ""
+            if state == 5 or any(k in reasons_lower for k in _HW_ERROR_KEYWORDS):
+                return True, reasons or "printer stopped"
+        except Exception:
+            pass
+        return False, ""
+
     tmp_path = None
     conn = None
     job_id = None
     try:
+        conn = cups_mod.Connection()
+
+        # Pre-flight: reject immediately if printer already has a hardware error
+        # (e.g. paper was already out before the job was sent).
+        has_err, err_reason = _printer_error(conn, cups_name)
+        if has_err:
+            _logger.warning("CUPS pre-flight: '%s' not ready — %s", cups_name, err_reason)
+            return {"success": False,
+                    "message": "Printer is not ready: %s" % err_reason}
+
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(pdf_bytes)
             tmp_path = f.name
 
-        conn = cups_mod.Connection()
         options = {}
         if copies > 1:
             options["copies"] = str(copies)
@@ -626,7 +668,16 @@ def _cups_ipp_print(cups_mod, pdf_bytes, cups_name, job_name, copies):
                     requested_attributes=["job-state", "job-state-reasons"],
                 )
             except Exception:
-                # Job removed from history — completed successfully
+                # Job no longer in CUPS active list — could be completed or purged after abort.
+                # Check printer state: if it has a hardware error the job likely failed.
+                has_err, err_reason = _printer_error(conn, cups_name)
+                if has_err:
+                    _logger.warning(
+                        "CUPS: job %d purged from history but printer reports error: %s",
+                        job_id, err_reason,
+                    )
+                    return {"success": False,
+                            "message": "Job sent but printer reports error: %s" % err_reason}
                 return {"success": True,
                         "message": "Printed via CUPS (%s)." % cups_name}
 
@@ -637,6 +688,19 @@ def _cups_ipp_print(cups_mod, pdf_bytes, cups_name, job_name, copies):
             reasons_lower = reasons.lower()
 
             if state == _IPP_JOB_COMPLETED:
+                # Some printer drivers (e.g. Brother network printers) report
+                # COMPLETED as soon as data is transferred to the printer's
+                # internal buffer — even when the printer has no paper.
+                # Wait briefly then check the printer's own state.
+                time.sleep(2)
+                has_err, err_reason = _printer_error(conn, cups_name)
+                if has_err:
+                    _logger.warning(
+                        "CUPS: job %d completed but printer reports error: %s",
+                        job_id, err_reason,
+                    )
+                    return {"success": False,
+                            "message": "Job sent but printer reports error: %s" % err_reason}
                 return {"success": True,
                         "message": "Printed via CUPS (%s)." % cups_name}
 
@@ -647,6 +711,26 @@ def _cups_ipp_print(cups_mod, pdf_bytes, cups_name, job_name, copies):
             if state == _IPP_JOB_CANCELLED:
                 return {"success": False,
                         "message": "CUPS job cancelled: %s" % (reasons or "(no reason)")}
+
+            if state == _IPP_JOB_STOPPED:
+                # Job stopped — check both job-state-reasons AND printer state.
+                # Drivers vary: some put "media-empty" in job reasons, others put
+                # "printer-stopped" in job reasons and the actual cause in printer state.
+                is_hw = any(k in reasons_lower for k in _HW_ERROR_KEYWORDS)
+                if not is_hw and "printer-stopped" in reasons_lower:
+                    is_hw, printer_reason = _printer_error(conn, cups_name)
+                    if is_hw:
+                        reasons = printer_reason
+                if is_hw:
+                    try:
+                        conn.cancelJob(job_id)
+                    except Exception:
+                        pass
+                    _logger.warning(
+                        "CUPS: job %d stopped on '%s': %s", job_id, cups_name, reasons
+                    )
+                    return {"success": False,
+                            "message": "Printer needs attention: %s" % (reasons or "hardware error")}
 
             if "connecting-to-device" in reasons_lower:
                 if connecting_since is None:
@@ -679,6 +763,30 @@ def _cups_ipp_print(cups_mod, pdf_bytes, cups_name, job_name, copies):
                 pass
 
 
+def _cups_lp_printer_error(cups_name):
+    """Check printer state via lpstat -p. Returns (is_error, reason_str)."""
+    _LP_ERROR_WORDS = ("stopped", "not accepting", "disabled", "paused")
+    _LP_HW_KEYWORDS = (
+        "media-empty", "media-needed", "paper", "jam", "toner",
+        "cover", "door", "offline", "out of paper", "no paper", "error",
+    )
+    try:
+        result = subprocess.run(
+            ["lpstat", "-p", cups_name, "-l"],
+            capture_output=True, text=True, timeout=5,
+        )
+        out = (result.stdout + result.stderr)
+        out_low = out.lower()
+        if any(w in out_low for w in _LP_ERROR_WORDS):
+            if any(k in out_low for k in _LP_HW_KEYWORDS):
+                return True, out.strip()[:200]
+            if "stopped" in out_low:
+                return True, out.strip()[:200]
+    except Exception:
+        pass
+    return False, ""
+
+
 def _cups_lp_print(pdf_bytes, cups_name, job_name, copies):
     """Fallback: submit via lp command when python-cups is unavailable.
 
@@ -688,6 +796,13 @@ def _cups_lp_print(pdf_bytes, cups_name, job_name, copies):
     """
     tmp_path = None
     try:
+        # Pre-flight: check printer state before submitting
+        has_err, err_reason = _cups_lp_printer_error(cups_name)
+        if has_err:
+            _logger.warning("CUPS lp pre-flight: '%s' not ready — %s", cups_name, err_reason)
+            return {"success": False,
+                    "message": "Printer is not ready: %s" % err_reason}
+
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(pdf_bytes)
             tmp_path = f.name
@@ -734,6 +849,12 @@ def _cups_lp_print(pdf_bytes, cups_name, job_name, copies):
                     capture_output=True, text=True, timeout=10,
                 )
                 if chk.stdout.strip():
+                    # CUPS says completed — verify printer has no immediate hardware error.
+                    time.sleep(2)
+                    has_err, err_reason = _cups_lp_printer_error(cups_name)
+                    if has_err:
+                        return {"success": False,
+                                "message": "Job sent but printer reports error: %s" % err_reason}
                     return {"success": True,
                             "message": "Printed via CUPS (%s)." % cups_name}
                 return {"success": False,
@@ -1190,11 +1311,7 @@ class StationClient:
             self._report_done(job_id, False, "Invalid PDF data: %s" % exc)
             return
 
-        printer_type = (job.get("printer_type") or "pdf").strip()
-        if printer_type == "escpos":
-            result = self._print_escpos(pdf_bytes, job)
-        else:
-            result = self._print_to_os_printer(pdf_bytes, printer_name, pdf_filename, copies)
+        result = self._print_to_os_printer(pdf_bytes, printer_name, pdf_filename, copies)
         self._report_done(job_id, result["success"], result["message"])
 
     def _print_to_os_printer(self, pdf_bytes, printer_name, job_name, copies):
@@ -1206,82 +1323,6 @@ class StationClient:
             return _send_cups(pdf_bytes, printer_name, job_name, copies)
         else:
             return {"success": False, "message": "No print backend available (lp/CUPS not found)."}
-
-    def _print_escpos(self, pdf_bytes, job):
-        """Rasterize PDF and send to a network ESC/POS thermal printer.
-
-        Pipeline:
-          1. pdf2image (poppler) converts the PDF page(s) to PIL images at 203 DPI.
-          2. python-escpos sends each image to the printer over TCP and cuts the paper.
-
-        System requirement: poppler-utils must be installed on the agent machine.
-          Linux : sudo apt-get install poppler-utils
-          macOS : brew install poppler
-          Windows: install poppler binaries and add to PATH
-        """
-        job_id = job.get("id")
-        paper_width_mm = int(job.get("paper_width_mm") or 80)
-        printer_ip = (job.get("printer_ip") or "").strip()
-        printer_port = int(job.get("printer_tcp_port") or 9100)
-        copies = max(1, int(job.get("copies") or 1))
-
-        # ── Dependency checks ─────────────────────────────────────────────────
-        try:
-            from pdf2image import convert_from_bytes
-        except ImportError:
-            return {
-                "success": False,
-                "message": (
-                    "pdf2image is not installed. "
-                    "Run: pip install pdf2image  and  apt install poppler-utils"
-                ),
-            }
-
-        try:
-            from escpos.printer import Network as EscNetwork
-        except ImportError:
-            return {
-                "success": False,
-                "message": "python-escpos is not installed. Run: pip install python-escpos",
-            }
-
-        if not printer_ip:
-            return {
-                "success": False,
-                "message": (
-                    "ESC/POS printer has no IP address configured. "
-                    "Open the printer record in Odoo and set the Printer IP Address."
-                ),
-            }
-
-        # ── Step 1: Rasterize PDF → PIL images ───────────────────────────────
-        # 203 DPI is the standard resolution for thermal receipt printers.
-        # width_px is derived from the physical paper width so the image fills
-        # the printable area exactly without scaling on the printer side.
-        try:
-            width_px = int(paper_width_mm / 25.4 * 203)
-            images = convert_from_bytes(pdf_bytes, dpi=203, size=(width_px, None))
-        except Exception as exc:
-            return {"success": False, "message": "PDF rasterize failed: %s" % exc}
-
-        # ── Step 2: Send via ESC/POS ──────────────────────────────────────────
-        try:
-            p = EscNetwork(printer_ip, printer_port)
-            for _ in range(copies):
-                for img in images:
-                    p.image(img)
-                p.cut()
-            p.close()
-            _logger.info(
-                "ESC/POS job %s: %d page(s) × %d copies → %s:%d",
-                job_id, len(images), copies, printer_ip, printer_port,
-            )
-            return {
-                "success": True,
-                "message": "ESC/POS print OK — %d page(s)" % len(images),
-            }
-        except Exception as exc:
-            return {"success": False, "message": "ESC/POS send failed: %s" % exc}
 
     def _report_done(self, job_id, success, message):
         try:
